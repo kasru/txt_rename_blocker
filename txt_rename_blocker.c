@@ -91,7 +91,7 @@ static bool check_file_header(const char *path)
     loff_t pos = 0;
     char buf[HEADER_SIZE];
 
-    if (!header_configured || !preemptible())
+    if (!header_configured)
         return false;
 
     f = filp_open(path, O_RDONLY, 0);
