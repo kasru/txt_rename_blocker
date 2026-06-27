@@ -15,9 +15,8 @@
 #include <linux/ftrace.h>
 #include <linux/fs.h>
 #include <linux/file.h>
-#include <linux/uaccess.h>
 #include <linux/err.h>
-#include <linux/string.h>
+#include <linux/compiler.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Developer");
@@ -35,12 +34,11 @@ static bool header_configured;
 
 static unsigned long find_sym(const char *name)
 {
-    if (!kln_func) {
-        struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
-        if (!register_kprobe(&kp)) {
-            kln_func = (void *)kp.addr;
-            unregister_kprobe(&kp);
-        }
+    struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+
+    if (!kln_func && !register_kprobe(&kp)) {
+        kln_func = (void *)kp.addr;
+        unregister_kprobe(&kp);
     }
     return kln_func ? kln_func(name) : 0;
 }
@@ -50,7 +48,6 @@ static void read_config(void)
 {
     struct file *f;
     loff_t pos = 0;
-    ssize_t ret;
 
     f = filp_open(CONFIG_PATH, O_RDONLY, 0);
     if (IS_ERR(f)) {
@@ -59,46 +56,44 @@ static void read_config(void)
         return;
     }
 
-    ret = kernel_read(f, protected_header, HEADER_SIZE, &pos);
-    if (ret < HEADER_SIZE) {
-        pr_warn("txt_rename_blocker: %s too short (read %zd, need %d)\n",
-            CONFIG_PATH, ret, HEADER_SIZE);
-        fput(f);
-        return;
+    if (kernel_read(f, protected_header, HEADER_SIZE, &pos) >= HEADER_SIZE) {
+        header_configured = true;
+        pr_info("txt_rename_blocker: read protected header from %s\n",
+            CONFIG_PATH);
+    } else {
+        pr_warn("txt_rename_blocker: %s too short\n", CONFIG_PATH);
     }
-
-    header_configured = true;
-    pr_info("txt_rename_blocker: read protected header from %s\n", CONFIG_PATH);
     fput(f);
 }
 
 /* Проверка расширения .txt */
 static bool is_txt_file(const char *name)
 {
-    size_t len;
+    const char *p = name;
 
-    len = strlen(name);
-    if (len < 4)
+    while (*p)
+        p++;
+
+    if (p - name < 4)
         return false;
 
-    return (strcmp(name + len - 4, ".txt") == 0);
+    return p[-4] == '.' && p[-3] == 't' && p[-2] == 'x' && p[-1] == 't';
 }
 
-/* Чтение начала файла */
 static bool check_file_header(const char *path)
 {
     struct file *f;
     loff_t pos = 0;
     char buf[HEADER_SIZE];
 
-    if (!header_configured)
+    if (unlikely(!header_configured))
         return false;
 
     f = filp_open(path, O_RDONLY, 0);
-    if (IS_ERR(f))
+    if (unlikely(IS_ERR(f)))
         return false;
 
-    if (kernel_read(f, buf, HEADER_SIZE, &pos) < HEADER_SIZE) {
+    if (unlikely(kernel_read(f, buf, HEADER_SIZE, &pos) < HEADER_SIZE)) {
         fput(f);
         return false;
     }
@@ -112,10 +107,9 @@ static void notrace rename_handler(unsigned long ip, unsigned long parent_ip,
 {
     struct pt_regs *regs;
     struct filename *oldname;
-    const char *name;
 
     regs = ftrace_get_regs(fregs);
-    if (!regs)
+    if (unlikely(!regs))
         return;
 
 #ifdef CONFIG_X86_64
@@ -123,15 +117,13 @@ static void notrace rename_handler(unsigned long ip, unsigned long parent_ip,
 #else
 #error "txt_rename_blocker: only x86_64 supported"
 #endif
-    if (!oldname || IS_ERR(oldname) || !oldname->name)
+    if (unlikely(!oldname || IS_ERR(oldname) || !oldname->name))
         return;
 
-    name = oldname->name;
-
-    if (!is_txt_file(name))
+    if (!is_txt_file(oldname->name))
         return;
 
-    if (!check_file_header(name))
+    if (!check_file_header(oldname->name))
         return;
 
     regs->ax = -EPERM;
@@ -152,7 +144,6 @@ static struct kprobe kp_finder = {
 static int __init txt_rename_blocker_init(void)
 {
     int ret;
-    unsigned long addr;
 
     read_config();
 
@@ -164,15 +155,13 @@ static int __init txt_rename_blocker_init(void)
     target_addr = (unsigned long)kp_finder.addr;
     unregister_kprobe(&kp_finder);
 
-    addr = find_sym("override_function_with_return");
-    if (addr) {
-        ovr_func = (void (*)(struct pt_regs *))addr;
-        pr_info("txt_rename_blocker: override_function_with_return at 0x%lx\n",
-            addr);
-    } else {
+    ovr_func = (void (*)(struct pt_regs *))find_sym("override_function_with_return");
+    if (!ovr_func) {
         pr_err("txt_rename_blocker: override_function_with_return not found\n");
         return -ENXIO;
     }
+    pr_info("txt_rename_blocker: override_function_with_return at 0x%lx\n",
+        (unsigned long)ovr_func);
 
     ret = ftrace_set_filter_ip(&fops_rename, target_addr, 0, 0);
     if (ret) {
@@ -195,10 +184,8 @@ static int __init txt_rename_blocker_init(void)
 /* Выгрузка модуля */
 static void __exit txt_rename_blocker_exit(void)
 {
-    int ret;
-    ret = unregister_ftrace_function(&fops_rename);
-    if (ret)
-        pr_err("txt_rename_blocker: unregister_ftrace failed: %d\n", ret);
+    if (unregister_ftrace_function(&fops_rename))
+        pr_err("txt_rename_blocker: unregister_ftrace failed\n");
     ftrace_set_filter_ip(&fops_rename, target_addr, 1, 0);
     pr_info("txt_rename_blocker: unloaded\n");
 }
